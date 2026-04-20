@@ -1,0 +1,335 @@
+<div id="rp-root" class="rp-shell">
+        <div id="rp-auth-view" class="fullscreen-wrapper active">
+
+            <div class="bg-glow"></div>
+
+            <div class="container">
+
+                <div class="left">
+                    <div class="text-stage" id="textStage">
+                        <h1 id="leftTitle">Hello,<br>Welcome!</h1>
+                        <p id="leftDesc">Sign in to continue shopping your favourite items.</p>
+                        <div class="left-role-pill customer" id="leftPill">
+                            <div class="pill-dot"></div>
+                            <span id="pillText">Shopping as Customer</span>
+                        </div>
+                    </div>
+                    <button class="btn-toggle" id="toggleBtn">Home Page</button>
+                </div>
+
+                <div class="right">
+                    <div class="card">
+
+                        <div class="brand-section">
+                            <img src="/static/Images/chit_chat.png" alt="Shopy Logo">
+                            <h3>Shopy</h3>
+                        </div>
+
+                        <div class="tab-nav">
+                            <div class="tab-item active" id="tabLogin">LOGIN</div>
+                            <div class="tab-item" id="tabRegister">REGISTER</div>
+                        </div>
+
+                        <div class="overflow-wrapper">
+                            <div class="form-slider" id="slider">
+
+                                <div class="form-page">
+                                    <form method="POST" action="/login">
+                                        <div class="role-section-label">I am a</div>
+                                        <div class="role-selector">
+                                            <button type="button" class="role-sel-btn sel-customer"
+                                                            id="lBtnCustomer" onclick="setLoginRole('customer')">
+                                                <div class="rdot"></div> Customer
+                                            </button>
+                                            <button type="button" class="role-sel-btn"
+                                                            id="lBtnRetailer" onclick="setLoginRole('retailer')">
+                                                <div class="rdot"></div> Retailer
+                                            </button>
+                                        </div>
+                                        <input type="hidden" name="role" id="lRoleInput" value="customer">
+
+                                        <div class="input-group">
+                                            <label>Email Address</label>
+                                            <input type="email" name="email" placeholder="you@email.com" required>
+                                        </div>
+                                        <div class="input-group">
+                                            <label>Password</label>
+                                            <div class="input-wrapper">
+                                                <input type="password" name="password" id="loginPass" placeholder="Enter password" required>
+                                                <span class="pass-toggle" onclick="togglePassword()">SHOW</span>
+                                            </div>
+                                        </div>
+                                        <button type="submit" class="primary-btn" id="loginBtn">Log In</button>
+                                    </form>
+                                </div>
+
+                                <div class="form-page">
+                                    <form method="POST" action="/register">
+                                        <div class="role-section-label">Register as</div>
+                                        <div class="role-selector">
+                                            <button type="button" class="role-sel-btn sel-customer"
+                                                            id="rBtnCustomer" onclick="setRegRole('customer')">
+                                                <div class="rdot"></div> Customer
+                                            </button>
+                                            <button type="button" class="role-sel-btn"
+                                                            id="rBtnRetailer" onclick="setRegRole('retailer')">
+                                                <div class="rdot"></div> Retailer
+                                            </button>
+                                        </div>
+                                        <input type="hidden" name="role" id="rRoleInput" value="customer">
+
+                                        <div class="input-row">
+                                            <div class="input-group">
+                                                <label>Username</label>
+                                                <input type="text" name="username" placeholder="Username" required>
+                                            </div>
+                                            <div class="input-group">
+                                                <label>Email</label>
+                                                <input type="email" name="email" placeholder="you@email.com" required>
+                                            </div>
+                                        </div>
+                                        <div class="input-group">
+                                            <label>Set Password</label>
+                                            <input type="password" name="password" placeholder="Password" required>
+                                        </div>
+                                        <button type="submit" class="primary-btn" id="registerBtn">Create Account</button>
+                                    </form>
+                                </div>
+
+                            </div>
+                        </div>
+
+                    </div>
+        </div>
+            </div>
+        </div>
+
+    <section id="rp-app-view" class="rp-app">
+        <aside class="rp-sidebar">
+            <div class="rp-sidebar-brand">
+                <strong>Shopy</strong>
+                <span>Retailer A2Z</span>
+            </div>
+            <nav class="rp-nav">
+                <button class="rp-nav-btn active" data-nav="dashboard"><span class="rp-nav-dot"></span><span>Dashboard</span></button>
+                <button class="rp-nav-btn" data-nav="products"><span class="rp-nav-dot"></span><span>Products</span></button>
+                <button class="rp-nav-btn" data-nav="orders"><span class="rp-nav-dot"></span><span>Orders</span></button>
+                <button class="rp-nav-btn" data-nav="assistant"><span class="rp-nav-dot"></span><span>Assistant</span></button>
+                <button class="rp-nav-btn" data-nav="profile"><span class="rp-nav-dot"></span><span>Profile</span></button>
+            </nav>
+            <div class="rp-sidebar-foot">
+                <div class="rp-user">
+                    <div id="rp-user-avatar" class="rp-user-avatar">R</div>
+                    <div class="rp-user-meta">
+                        <strong id="rp-sidebar-user">Retailer</strong>
+                        <span id="rp-sidebar-email">retailer@shop.com</span>
+                    </div>
+                </div>
+                <button id="rp-logout-btn" class="rp-btn-ghost" type="button" style="width:100%">Logout</button>
+            </div>
+        </aside>
+
+        <main class="rp-main">
+            <div class="rp-top">
+                <div>
+                    <h2 id="rp-view-title" class="rp-title">Dashboard</h2>
+                    <p class="rp-subtitle">Live retailer module running on Gradio bridge</p>
+                </div>
+                <button id="rp-top-refresh" class="rp-btn-ghost" type="button">Refresh View</button>
+            </div>
+
+            <div class="rp-views">
+                <section class="rp-view active" data-view="dashboard">
+                    <div class="rp-grid-stats">
+                        <article class="rp-stat-card">
+                            <div class="rp-stat-label">Active Products</div>
+                            <div id="rp-stat-products" class="rp-stat-value">0</div>
+                        </article>
+                        <article class="rp-stat-card">
+                            <div class="rp-stat-label">Orders</div>
+                            <div id="rp-stat-orders" class="rp-stat-value">0</div>
+                        </article>
+                        <article class="rp-stat-card">
+                            <div class="rp-stat-label">Revenue</div>
+                            <div id="rp-stat-revenue" class="rp-stat-value">0</div>
+                        </article>
+                        <article class="rp-stat-card">
+                            <div class="rp-stat-label">Pending</div>
+                            <div id="rp-stat-pending" class="rp-stat-value">0</div>
+                        </article>
+                    </div>
+
+                    <article class="rp-panel">
+                        <h3 class="rp-panel-title">Recent Orders</h3>
+                        <div class="rp-table-wrap">
+                            <table class="rp-table">
+                                <thead>
+                                    <tr><th>Order</th><th>Customer</th><th>Status</th><th>Items</th><th>Total</th><th>Date</th></tr>
+                                </thead>
+                                <tbody id="rp-dashboard-orders-body"></tbody>
+                            </table>
+                        </div>
+                    </article>
+
+                    <article class="rp-panel">
+                        <h3 class="rp-panel-title">Top Products</h3>
+                        <div class="rp-table-wrap">
+                            <table class="rp-table">
+                                <thead>
+                                    <tr><th>Product</th><th>Stock</th><th>Price</th><th>Sold</th></tr>
+                                </thead>
+                                <tbody id="rp-dashboard-top-body"></tbody>
+                            </table>
+                        </div>
+                    </article>
+                </section>
+
+                <section class="rp-view" data-view="products">
+                    <div class="rp-products-layout">
+                        <article class="rp-panel">
+                            <h3 class="rp-panel-title">Your Products</h3>
+                            <div class="rp-table-wrap">
+                                <table class="rp-table">
+                                    <thead>
+                                        <tr><th>ID</th><th>Name</th><th>Category</th><th>Price</th><th>Stock</th><th>Status</th><th>Actions</th></tr>
+                                    </thead>
+                                    <tbody id="rp-products-body"></tbody>
+                                </table>
+                            </div>
+                        </article>
+
+                        <article class="rp-panel">
+                            <h3 class="rp-panel-title">Add / Edit Product</h3>
+                            <div class="rp-form-grid">
+                                <input id="rp-product-id" type="hidden">
+                                <div>
+                                    <label class="rp-label" for="rp-product-name">Product Name</label>
+                                    <input id="rp-product-name" class="rp-input" type="text" placeholder="Product title">
+                                </div>
+                                <div>
+                                    <label class="rp-label" for="rp-product-description">Description</label>
+                                    <textarea id="rp-product-description" class="rp-textarea" placeholder="Short product description"></textarea>
+                                </div>
+                                <div>
+                                    <label class="rp-label" for="rp-product-price">Price</label>
+                                    <input id="rp-product-price" class="rp-input" type="number" step="0.01" min="0" placeholder="0.00">
+                                </div>
+                                <div>
+                                    <label class="rp-label" for="rp-product-original-price">Original Price</label>
+                                    <input id="rp-product-original-price" class="rp-input" type="number" step="0.01" min="0" placeholder="Optional">
+                                </div>
+                                <div>
+                                    <label class="rp-label" for="rp-product-stock">Stock</label>
+                                    <input id="rp-product-stock" class="rp-input" type="number" min="0" placeholder="0">
+                                </div>
+                                <div>
+                                    <label class="rp-label" for="rp-product-category">Category</label>
+                                    <select id="rp-product-category" class="rp-select"></select>
+                                </div>
+                                <div>
+                                    <label class="rp-label" for="rp-product-sku">SKU</label>
+                                    <input id="rp-product-sku" class="rp-input" type="text" placeholder="Optional SKU">
+                                </div>
+                                <div>
+                                    <label class="rp-label" for="rp-product-weight">Weight (grams)</label>
+                                    <input id="rp-product-weight" class="rp-input" type="number" min="0" placeholder="Optional">
+                                </div>
+                                <div>
+                                    <label class="rp-label" for="rp-product-image">Image URL / Data</label>
+                                    <textarea id="rp-product-image" class="rp-textarea" placeholder="Paste image URL or base64 data"></textarea>
+                                </div>
+                                <div>
+                                    <label class="rp-label" for="rp-product-active">Status</label>
+                                    <select id="rp-product-active" class="rp-select">
+                                        <option value="1">Active</option>
+                                        <option value="0">Inactive</option>
+                                    </select>
+                                </div>
+                                <div class="rp-inline-actions">
+                                    <button id="rp-product-save" class="rp-btn" type="button">Save Product</button>
+                                    <button id="rp-product-clear" class="rp-btn-ghost" type="button">Clear Form</button>
+                                    <button id="rp-product-delete" class="rp-btn-danger" type="button">Deactivate</button>
+                                </div>
+                            </div>
+                        </article>
+                    </div>
+                </section>
+
+                <section class="rp-view" data-view="orders">
+                    <article class="rp-panel">
+                        <div class="rp-orders-head">
+                            <h3 class="rp-panel-title" style="margin:0">Retailer Orders</h3>
+                            <div class="rp-inline-actions">
+                                <select id="rp-orders-filter" class="rp-select">
+                                    <option value="">All</option>
+                                    <option value="pending">Pending</option>
+                                    <option value="processing">Processing</option>
+                                    <option value="shipped">Shipped</option>
+                                    <option value="delivered">Delivered</option>
+                                    <option value="cancelled">Cancelled</option>
+                                </select>
+                                <button id="rp-orders-refresh" class="rp-btn-ghost" type="button">Refresh</button>
+                            </div>
+                        </div>
+
+                        <div class="rp-table-wrap">
+                            <table class="rp-table">
+                                <thead>
+                                    <tr><th>Order</th><th>Customer</th><th>Items</th><th>Retailer Total</th><th>Status</th><th>Update</th></tr>
+                                </thead>
+                                <tbody id="rp-orders-body"></tbody>
+                            </table>
+                        </div>
+                    </article>
+                </section>
+
+                <section class="rp-view" data-view="assistant">
+                    <article class="rp-assistant-wrap">
+                        <div class="rp-assistant-top">
+                            <button class="rp-chip" data-prompt="Give me today's retailer health check from my current data.">Health Check</button>
+                            <button class="rp-chip" data-prompt="Which products are low stock and how much should I reorder?">Low Stock</button>
+                            <button class="rp-chip" data-prompt="Show my top revenue products with reasons.">Top Revenue</button>
+                            <button class="rp-chip" data-prompt="Analyze pending orders and suggest immediate actions.">Order Risk</button>
+                            <button class="rp-chip" data-prompt="Create a 7-day action plan to increase sales.">7-Day Plan</button>
+                        </div>
+                        <div id="rp-assistant-messages" class="rp-chat"></div>
+                        <div class="rp-assistant-input">
+                            <input id="rp-assistant-input" class="rp-input" type="text" placeholder="Ask Sage anything about your retailer business..." autocomplete="off">
+                            <button id="rp-assistant-send" class="rp-btn" type="button">Send</button>
+                        </div>
+                    </article>
+                </section>
+
+                <section class="rp-view" data-view="profile">
+                    <article class="rp-panel">
+                        <h3 class="rp-panel-title">Retailer Profile</h3>
+                        <div class="rp-form-grid">
+                            <div>
+                                <label class="rp-label" for="rp-profile-name">Username</label>
+                                <input id="rp-profile-name" class="rp-input" type="text">
+                            </div>
+                            <div>
+                                <label class="rp-label" for="rp-profile-email">Email</label>
+                                <input id="rp-profile-email" class="rp-input" type="email" readonly>
+                            </div>
+                            <div>
+                                <label class="rp-label" for="rp-profile-phone">Phone</label>
+                                <input id="rp-profile-phone" class="rp-input" type="text">
+                            </div>
+                            <div>
+                                <label class="rp-label" for="rp-profile-bio">Bio</label>
+                                <textarea id="rp-profile-bio" class="rp-textarea" placeholder="Write a short shop profile"></textarea>
+                            </div>
+                            <div class="rp-inline-actions">
+                                <button id="rp-profile-save" class="rp-btn" type="button">Save Profile</button>
+                            </div>
+                        </div>
+                    </article>
+                </section>
+            </div>
+        </main>
+    </section>
+
+    <div id="rp-toast-wrap" class="rp-toast-wrap"></div>
+    <div id="rp-busy" class="rp-busy"><div id="rp-busy-text" class="rp-busy-box">Loading...</div></div>
+</div>
