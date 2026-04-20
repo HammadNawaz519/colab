@@ -813,6 +813,8 @@ body,
     flex-direction: column;
     z-index: 20;
     border-right: 1px solid rgba(255, 255, 255, 0.08);
+    overflow-y: auto;
+    overflow-x: hidden;
 }
 
 .rp-sidebar-brand {
@@ -838,6 +840,7 @@ body,
 .rp-nav {
     padding: 14px;
     flex: 1;
+    min-height: 0;
 }
 
 .rp-nav-btn {
@@ -881,6 +884,10 @@ body,
 .rp-sidebar-foot {
     border-top: 1px solid rgba(255, 255, 255, 0.12);
     padding: 14px;
+    margin-top: auto;
+    background: linear-gradient(170deg, #1d2528 0%, #222f31 56%, #263436 100%);
+    position: sticky;
+    bottom: 0;
 }
 
 .rp-user {

@@ -1168,6 +1168,13 @@ def require_retailer_session(token: str) -> tuple[dict[str, Any] | None, str]:
     return session_info, ""
 
 
+def require_user_session(token: str) -> tuple[dict[str, Any] | None, str]:
+    session_info = get_auth_session(token)
+    if not session_info:
+        return None, "Session expired. Please login again."
+    return session_info, ""
+
+
 def action_login(data: dict[str, Any]) -> dict[str, Any]:
     email = str(data.get("email") or "").strip().lower()
     password = str(data.get("password") or "")
@@ -1332,7 +1339,7 @@ def action_logout(data: dict[str, Any]) -> dict[str, Any]:
 
 def action_session_resume(data: dict[str, Any]) -> dict[str, Any]:
     session_token = str(data.get("session_token") or "").strip()
-    session_info, err = require_retailer_session(session_token)
+    session_info, err = require_user_session(session_token)
     if not session_info:
         raise ValueError(err)
 
@@ -1340,9 +1347,9 @@ def action_session_resume(data: dict[str, Any]) -> dict[str, Any]:
         "session_token": session_token,
         "user": {
             "id": int(session_info["user_id"]),
-            "username": str(session_info.get("username") or "Retailer"),
+            "username": str(session_info.get("username") or "User"),
             "email": str(session_info.get("email") or ""),
-            "role": str(session_info.get("role") or "retailer"),
+            "role": str(session_info.get("role") or "customer"),
         },
     }
 
@@ -1730,6 +1737,61 @@ def action_retailer_profile_update(data: dict[str, Any]) -> dict[str, Any]:
     return {"username": username[:80], "message": "Profile updated."}
 
 
+def action_customer_profile(data: dict[str, Any]) -> dict[str, Any]:
+    session_info, err = require_user_session(str(data.get("session_token") or ""))
+    if not session_info:
+        raise ValueError(err)
+    if (session_info.get("role") or "") != "customer":
+        raise ValueError("Customer access is required for this action.")
+
+    user_id = int(session_info["user_id"])
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, username, email, phone_number, role, profile_pic, bio, created_at
+        FROM users
+        WHERE id = ?
+        """,
+        (user_id,),
+    )
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not user:
+        raise ValueError("User not found.")
+
+    return {"user": dict(user)}
+
+
+def action_customer_profile_update(data: dict[str, Any]) -> dict[str, Any]:
+    session_info, err = require_user_session(str(data.get("session_token") or ""))
+    if not session_info:
+        raise ValueError(err)
+    if (session_info.get("role") or "") != "customer":
+        raise ValueError("Customer access is required for this action.")
+
+    username = str(data.get("username") or "").strip()
+    phone = str(data.get("phone_number") or data.get("phone") or "").strip()
+    bio = str(data.get("bio") or "").strip()[:500]
+    if not username:
+        raise ValueError("Username is required.")
+
+    user_id = int(session_info["user_id"])
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET username=?, phone_number=?, bio=?, updated_at=? WHERE id=?",
+        (username[:80], phone[:30], bio, sql_now_str(), user_id),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    session_info["username"] = username[:80]
+    return {"username": username[:80], "message": "Profile updated."}
+
+
 def encode_structured_bot_message(payload: dict[str, Any]) -> str:
     body: dict[str, Any] = {"_sage_structured": True, "answer": str(payload.get("answer") or "")}
     if SHOW_DEBUG_DETAILS:
@@ -1865,6 +1927,77 @@ def action_assistant_history(data: dict[str, Any]) -> dict[str, Any]:
     return {"history": history}
 
 
+def action_customer_assistant_chat(data: dict[str, Any]) -> dict[str, Any]:
+    session_info, err = require_user_session(str(data.get("session_token") or ""))
+    if not session_info:
+        raise ValueError(err)
+    if (session_info.get("role") or "") != "customer":
+        raise ValueError("Customer access is required for this action.")
+
+    message = str(data.get("message") or "").strip()
+    if not message:
+        raise ValueError("Please type a message first.")
+
+    answer, sql_text, db_output, status = process_question_with_mode(message, "Customer")
+    bot_payload: dict[str, Any] = {"answer": answer}
+    if SHOW_DEBUG_DETAILS:
+        bot_payload["query_ran"] = sql_text
+        bot_payload["db_output"] = db_output
+        bot_payload["status"] = status
+
+    conn = sqlite_connect_rw()
+    try:
+        insert_ai_chat_row(conn, int(session_info["user_id"]), "customer", "user", message)
+        insert_ai_chat_row(conn, int(session_info["user_id"]), "customer", "bot", encode_structured_bot_message(bot_payload))
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"reply": bot_payload}
+
+
+def action_customer_assistant_history(data: dict[str, Any]) -> dict[str, Any]:
+    session_info, err = require_user_session(str(data.get("session_token") or ""))
+    if not session_info:
+        raise ValueError(err)
+    if (session_info.get("role") or "") != "customer":
+        raise ValueError("Customer access is required for this action.")
+
+    user_id = int(session_info["user_id"])
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT sender, message, created_at
+        FROM ai_chat_history
+        WHERE user_id = ? AND role = 'customer'
+        ORDER BY id DESC
+        LIMIT 40
+        """,
+        (user_id,),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+
+    rows.reverse()
+    history: list[dict[str, Any]] = []
+    for row in rows:
+        sender = str(row.get("sender") or "bot").lower()
+        message = row.get("message") or ""
+        if sender == "bot":
+            message = decode_structured_bot_message(str(message))
+        history.append(
+            {
+                "sender": "user" if sender == "user" else "bot",
+                "message": message,
+                "created_at": format_history_ts(row.get("created_at")),
+            }
+        )
+
+    return {"history": history}
+
+
 # ============================================================
 # [SECTION: BRIDGE DISPATCH]
 # ============================================================
@@ -1916,8 +2049,12 @@ def bridge_dispatch(action: str, payload_json: str) -> str:
             "retailer_update_order_status": action_retailer_update_order_status,
             "retailer_profile": action_retailer_profile,
             "retailer_profile_update": action_retailer_profile_update,
+            "customer_profile": action_customer_profile,
+            "customer_profile_update": action_customer_profile_update,
             "assistant_chat": action_assistant_chat,
             "assistant_history": action_assistant_history,
+            "customer_assistant_chat": action_customer_assistant_chat,
+            "customer_assistant_history": action_customer_assistant_history,
         }
         handler = handlers.get(action_name)
         if not handler:
@@ -1927,6 +2064,27 @@ def bridge_dispatch(action: str, payload_json: str) -> str:
         return bridge_response(request_id, action_name, True, data=data_out)
     except Exception as exc:
         return bridge_response(request_id, action_name or "unknown", False, error=str(exc))
+
+
+def load_runtime_asset_text(filename: str, fallback: str) -> str:
+    """Load editable frontend assets from disk with safe fallback."""
+    asset_path = ROOT_DIR / filename
+    if not asset_path.exists():
+        return fallback
+
+    try:
+        text = asset_path.read_text(encoding="utf-8")
+    except Exception:
+        return fallback
+
+    return text if text.strip() else fallback
+
+
+def get_runtime_assets() -> tuple[str, str, str]:
+    css_text = load_runtime_asset_text("app.css", APP_CSS)
+    js_text = load_runtime_asset_text("app.js", APP_JS)
+    html_text = load_runtime_asset_text("retailer_ui.html", RETAILER_UI_HTML)
+    return css_text, js_text, html_text
 
 
 # ============================================================
@@ -4910,14 +5068,23 @@ function () {
 # ============================================================
 # [SECTION: GRADIO APP]
 # ============================================================
-def build_app(embed_assets_in_constructor: bool = False) -> Any:
+def build_app(
+    embed_assets_in_constructor: bool = False,
+    css_text: str | None = None,
+    js_text: str | None = None,
+    html_text: str | None = None,
+) -> Any:
     if gr is None:
         raise RuntimeError("Gradio is not installed. Install it with: pip install gradio")
 
+    css_value = css_text if css_text is not None else APP_CSS
+    js_value = js_text if js_text is not None else APP_JS
+    html_value = html_text if html_text is not None else RETAILER_UI_HTML
+
     blocks_kwargs: dict[str, Any] = {"title": "Shopy Retailer Portal"}
     if embed_assets_in_constructor:
-        blocks_kwargs["css"] = APP_CSS
-        blocks_kwargs["js"] = APP_JS
+        blocks_kwargs["css"] = css_value
+        blocks_kwargs["js"] = js_value
 
     with gr.Blocks(**blocks_kwargs) as demo:
         with gr.Column(elem_id="bridge-zone"):
@@ -4926,7 +5093,7 @@ def build_app(embed_assets_in_constructor: bool = False) -> Any:
             bridge_output = gr.Textbox(value="", label="output", elem_id="bridge-output")
             bridge_submit = gr.Button("submit", elem_id="bridge-submit")
 
-        gr.HTML(RETAILER_UI_HTML)
+        gr.HTML(html_value)
 
         bridge_submit.click(
             fn=bridge_dispatch,
@@ -4944,19 +5111,25 @@ def main() -> None:
 
     bootstrap_database(DB_PATH)
     in_colab = ("google.colab" in sys.modules) or bool(os.getenv("COLAB_RELEASE_TAG"))
+    css_text, js_text, html_text = get_runtime_assets()
 
     launch_sig = inspect.signature(gr.Blocks.launch)
     launch_supports_assets = ("css" in launch_sig.parameters) and ("js" in launch_sig.parameters)
 
-    app = build_app(embed_assets_in_constructor=not launch_supports_assets)
+    app = build_app(
+        embed_assets_in_constructor=not launch_supports_assets,
+        css_text=css_text,
+        js_text=js_text,
+        html_text=html_text,
+    )
 
     launch_kwargs: dict[str, Any] = {
         "share": in_colab,
         "show_error": False,
     }
     if launch_supports_assets:
-        launch_kwargs["css"] = APP_CSS
-        launch_kwargs["js"] = APP_JS
+        launch_kwargs["css"] = css_text
+        launch_kwargs["js"] = js_text
 
     app.launch(**launch_kwargs)
 

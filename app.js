@@ -443,6 +443,37 @@ function () {
         }
     }
 
+    function currentRole() {
+        return asText(state.user && state.user.role ? state.user.role : "").trim().toLowerCase();
+    }
+
+    function isRetailerUser() {
+        return currentRole() === "retailer";
+    }
+
+    function roleAction(retailerAction, customerAction) {
+        return isRetailerUser() ? retailerAction : customerAction;
+    }
+
+    function applyRoleNavigation() {
+        const isRetailer = isRetailerUser();
+        const allowedNavs = isRetailer
+            ? ["dashboard", "products", "orders", "assistant", "profile"]
+            : ["assistant", "profile"];
+
+        root.querySelectorAll(".rp-nav-btn[data-nav]").forEach((btn) => {
+            const nav = asText(btn.getAttribute("data-nav") || "");
+            btn.style.display = allowedNavs.indexOf(nav) >= 0 ? "flex" : "none";
+        });
+
+        const subtitle = root.querySelector(".rp-subtitle");
+        if (subtitle) {
+            subtitle.textContent = isRetailer
+                ? "Live retailer module running on Gradio bridge"
+                : "Customer portal running on Gradio bridge";
+        }
+    }
+
     async function logout(showMsg) {
         const currentToken = asText(state.sessionToken);
         if (currentToken) {
@@ -779,7 +810,8 @@ function () {
         }
         setBusy(true, "Loading profile...");
         try {
-            const data = await withRetailerSession("retailer_profile", {});
+            const action = roleAction("retailer_profile", "customer_profile");
+            const data = await withRetailerSession(action, {});
             const user = data.user || {};
             byId("rp-profile-name").value = asText(user.username || "");
             byId("rp-profile-email").value = asText(user.email || "");
@@ -797,7 +829,8 @@ function () {
         }
         setBusy(true, "Loading assistant chat...");
         try {
-            const data = await withRetailerSession("assistant_history", {});
+            const action = roleAction("assistant_history", "customer_assistant_history");
+            const data = await withRetailerSession(action, {});
             const history = data.history || [];
             const chat = getChatNode();
             if (chat) {
@@ -817,6 +850,15 @@ function () {
     }
 
     async function loadCurrentView(force) {
+        if (!isRetailerUser()) {
+            if (state.currentView === "profile") {
+                await loadProfile(force);
+                return;
+            }
+            await loadAssistantHistory(force);
+            return;
+        }
+
         if (state.currentView === "dashboard") {
             await loadDashboard(force);
             return;
@@ -839,6 +881,9 @@ function () {
     }
 
     async function switchView(viewName, force) {
+        if (!isRetailerUser() && ["assistant", "profile"].indexOf(asText(viewName)) === -1) {
+            viewName = "assistant";
+        }
         setView(viewName);
         try {
             await loadCurrentView(Boolean(force));
@@ -927,7 +972,8 @@ function () {
                 phone_number: asText(byId("rp-profile-phone").value || "").trim(),
                 bio: asText(byId("rp-profile-bio").value || "").trim(),
             };
-            await withRetailerSession("retailer_profile_update", payload);
+            const action = roleAction("retailer_profile_update", "customer_profile_update");
+            await withRetailerSession(action, payload);
             if (state.user) {
                 state.user.username = payload.username || state.user.username;
                 updateSidebarUser(state.user);
@@ -948,7 +994,8 @@ function () {
         appendChatMessage("user", text, "");
         appendTyping();
         try {
-            const data = await withRetailerSession("assistant_chat", { message: text });
+            const action = roleAction("assistant_chat", "customer_assistant_chat");
+            const data = await withRetailerSession(action, { message: text });
             removeTyping();
             appendChatMessage("bot", data.reply || "No response.", "");
         } catch (err) {
@@ -979,18 +1026,12 @@ function () {
                 role: role,
             });
 
-            if (asText(data.user && data.user.role).toLowerCase() !== "retailer") {
-                saveSessionToken("");
-                state.user = null;
-                setAuthMessage("Customer login is not available in this retailer portal. Please choose Retailer.", true, "login");
-                return;
-            }
-
             state.user = data.user || null;
             saveSessionToken(data.session_token || "");
             updateSidebarUser(state.user || {});
+            applyRoleNavigation();
             showAppView();
-            setView("dashboard");
+            setView(isRetailerUser() ? "dashboard" : "assistant");
             resetLoaded();
             await loadCurrentView(true);
             toast("Welcome back.", "ok");
@@ -1032,20 +1073,12 @@ function () {
                 otp: asText(registration.otp_hint || ""),
             });
 
-            if (asText(verification.user && verification.user.role).toLowerCase() !== "retailer") {
-                saveSessionToken("");
-                state.user = null;
-                setMode(false);
-                setAuthMessage("Customer account created. Please choose Retailer to access this portal.", true, "login");
-                toast("Account created successfully.", "ok");
-                return;
-            }
-
             state.user = verification.user || null;
             saveSessionToken(verification.session_token || "");
             updateSidebarUser(state.user || {});
+            applyRoleNavigation();
             showAppView();
-            setView("dashboard");
+            setView(isRetailerUser() ? "dashboard" : "assistant");
             resetLoaded();
             await loadCurrentView(true);
             toast("Account verified successfully.", "ok");
@@ -1067,16 +1100,11 @@ function () {
         setBusy(true, "Restoring session...");
         try {
             const data = await callBridge("session_resume", { session_token: token });
-            if (asText(data.user && data.user.role).toLowerCase() !== "retailer") {
-                saveSessionToken("");
-                state.user = null;
-                showAuthView();
-                return;
-            }
             state.user = data.user || null;
             updateSidebarUser(state.user || {});
+            applyRoleNavigation();
             showAppView();
-            setView("dashboard");
+            setView(isRetailerUser() ? "dashboard" : "assistant");
             resetLoaded();
             await loadCurrentView(true);
         } catch (_err) {
@@ -1102,7 +1130,9 @@ function () {
         }
         if (toggleBtn) {
             toggleBtn.onclick = () => {
-                window.location.href = "/landing";
+                setMode(false);
+                setLoginRole("customer");
+                clearAuthMessage();
             };
         }
 
@@ -1268,7 +1298,7 @@ function () {
 
         try {
             await waitForBridge();
-            await trySessionResume();
+            showAuthView();
         } catch (err) {
             setAuthMessage(asText(err && err.message ? err.message : err), true, "login");
             showAuthView();
