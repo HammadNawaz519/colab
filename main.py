@@ -9,6 +9,7 @@ This module bundles:
 
 from __future__ import annotations
 
+import base64
 import inspect
 import json
 import os
@@ -20,6 +21,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlencode
 
 import requests
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -29,6 +31,26 @@ try:
 except Exception:
     gr = None
 
+try:
+    from fastapi import HTTPException, Request
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+except Exception:
+    HTTPException = None  # type: ignore[assignment]
+    class Request:  # type: ignore[no-redef]
+        pass
+
+    FileResponse = Any  # type: ignore[assignment]
+    HTMLResponse = Any  # type: ignore[assignment]
+    JSONResponse = Any  # type: ignore[assignment]
+    RedirectResponse = Any  # type: ignore[assignment]
+
+try:
+    from jinja2 import Environment, FileSystemLoader, select_autoescape
+except Exception:
+    Environment = None  # type: ignore[assignment]
+    FileSystemLoader = None  # type: ignore[assignment]
+    select_autoescape = None  # type: ignore[assignment]
+
 
 # ============================================================
 # [SECTION: GLOBALS]
@@ -36,6 +58,11 @@ except Exception:
 ROOT_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 DB_PATH = ROOT_DIR / "shopy_colab.db"
 SHOPY_SQL_PATH = ROOT_DIR / "shopy.sql"
+TEMPLATES_DIR = ROOT_DIR / "templates"
+STATIC_DIR = ROOT_DIR / "static"
+
+SESSION_COOKIE_NAME = "shopy_session_token"
+PENDING_COOKIE_NAME = "shopy_pending_token"
 
 # Optional in-file fallback key for quick Colab runs.
 # Prefer setting OPENROUTER_API_KEY in environment.
@@ -2064,6 +2091,1581 @@ def bridge_dispatch(action: str, payload_json: str) -> str:
         return bridge_response(request_id, action_name, True, data=data_out)
     except Exception as exc:
         return bridge_response(request_id, action_name or "unknown", False, error=str(exc))
+
+
+# ============================================================
+# [SECTION: TEMPLATE COMPAT LAYER]
+# ============================================================
+TEMPLATE_ENV_CACHE: Any | None = None
+
+
+class _TemplateRequestShim:
+    def __init__(self, args: dict[str, str]):
+        self.args = args
+
+
+def get_template_environment() -> Any:
+    global TEMPLATE_ENV_CACHE
+    if TEMPLATE_ENV_CACHE is not None:
+        return TEMPLATE_ENV_CACHE
+
+    if Environment is None or FileSystemLoader is None or select_autoescape is None:
+        raise RuntimeError("Jinja2 is required to render templates.")
+
+    TEMPLATE_ENV_CACHE = Environment(
+        loader=FileSystemLoader(str(TEMPLATES_DIR)),
+        autoescape=select_autoescape(["html", "xml"]),
+    )
+    return TEMPLATE_ENV_CACHE
+
+
+def template_url_for(endpoint: str, **values: Any) -> str:
+    if endpoint == "static":
+        filename = str(values.get("filename") or "").strip().lstrip("/")
+        static_path = (STATIC_DIR / filename).resolve()
+        if static_path.exists() and static_path.is_file():
+            return "/gradio_api/file=" + quote(str(static_path).replace("\\", "/"), safe="/:._-")
+
+        # Fallback inline SVG so templates still render when static assets are absent.
+        svg = (
+            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>"
+            "<rect width='64' height='64' rx='14' fill='#1A1C23'/>"
+            "<text x='50%' y='56%' dominant-baseline='middle' text-anchor='middle'"
+            " font-family='Arial' font-size='30' fill='#ffffff'>S</text></svg>"
+        )
+        return "data:image/svg+xml," + quote(svg)
+    return "/"
+
+
+def render_template_html(template_name: str, request: Request, **context: Any) -> Any:
+    env = get_template_environment()
+    template = env.get_template(template_name)
+    req_ctx = _TemplateRequestShim(dict(request.query_params))
+    html = template.render(request=req_ctx, url_for=template_url_for, **context)
+
+    # Keep icon paths working even for templates that hardcode /static.
+    fallback_icon = template_url_for("static", filename="Images/chit_chat.png")
+    html = html.replace("/static/Images/chit_chat.png", fallback_icon)
+    return HTMLResponse(content=html)
+
+
+def get_request_session(request: Request) -> tuple[str, dict[str, Any] | None]:
+    token = str(request.cookies.get(SESSION_COOKIE_NAME) or "").strip()
+    if not token:
+        return "", None
+    return token, get_auth_session(token)
+
+
+def set_session_cookie(response: Any, token: str) -> None:
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        token,
+        max_age=SESSION_TTL_MINUTES * 60,
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def clear_session_cookie(response: Any) -> None:
+    response.delete_cookie(SESSION_COOKIE_NAME)
+
+
+def set_pending_cookie(response: Any, pending_token: str) -> None:
+    response.set_cookie(
+        PENDING_COOKIE_NAME,
+        pending_token,
+        max_age=OTP_TTL_MINUTES * 60,
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def clear_pending_cookie(response: Any) -> None:
+    response.delete_cookie(PENDING_COOKIE_NAME)
+
+
+def redirect_to(path: str, **query: Any) -> Any:
+    clean = {k: str(v) for k, v in query.items() if v is not None and str(v) != ""}
+    url = path
+    if clean:
+        url += "?" + urlencode(clean)
+    return RedirectResponse(url=url, status_code=302)
+
+
+def require_page_session(
+    request: Request,
+    required_role: str | None = None,
+) -> tuple[str, dict[str, Any] | None, Any | None]:
+    token, session_info = get_request_session(request)
+    if not session_info:
+        return "", None, redirect_to("/login")
+
+    role = str(session_info.get("role") or "")
+    if required_role and role != required_role:
+        target = "/retailer/dashboard" if role == "retailer" else "/shop"
+        return "", None, redirect_to(target)
+
+    return token, session_info, None
+
+
+def require_api_session(
+    request: Request,
+    required_role: str | None = None,
+) -> tuple[str, dict[str, Any] | None, Any | None]:
+    token, session_info = get_request_session(request)
+    if not session_info:
+        return "", None, JSONResponse(
+            {"success": False, "error": "Please login first."},
+            status_code=401,
+        )
+
+    role = str(session_info.get("role") or "")
+    if required_role and role != required_role:
+        return "", None, JSONResponse(
+            {"success": False, "error": f"{required_role.title()} access is required."},
+            status_code=403,
+        )
+
+    return token, session_info, None
+
+
+async def parse_json_body(request: Request) -> dict[str, Any]:
+    try:
+        data = await request.json()
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def get_cart_count(user_id: int) -> int:
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute("SELECT COALESCE(SUM(quantity), 0) FROM cart WHERE user_id=?", (user_id,))
+    count = parse_int(cur.fetchone()[0], 0)
+    cur.close()
+    conn.close()
+    return count
+
+
+def get_customer_default_address(user_id: int) -> dict[str, Any] | None:
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, label, full_name, phone, address_line, city, province, postal_code, country
+        FROM addresses
+        WHERE user_id=?
+        ORDER BY is_default DESC, id DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return dict(row) if row else None
+
+
+def save_customer_default_address(user_id: int, data: dict[str, Any]) -> None:
+    label = str(data.get("label") or "Home").strip()[:40] or "Home"
+    full_name = str(data.get("full_name") or "").strip()[:100]
+    phone = str(data.get("phone") or "").strip()[:30]
+    address_line = str(data.get("address_line") or "").strip()[:400]
+    city = str(data.get("city") or "").strip()[:100]
+    province = str(data.get("province") or "").strip()[:100]
+    postal_code = str(data.get("postal_code") or "").strip()[:20]
+
+    if not address_line:
+        raise ValueError("Address line is required.")
+
+    now = sql_now_str()
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE addresses SET is_default=0 WHERE user_id=?", (user_id,))
+        cur.execute(
+            """
+            INSERT INTO addresses
+            (user_id, label, full_name, phone, address_line, city, province, postal_code, country, is_default, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pakistan', 1, ?)
+            """,
+            (user_id, label, full_name, phone, address_line, city, province, postal_code, now),
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_customer_shop_stats() -> dict[str, int]:
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM products WHERE is_active=1")
+    total_products = parse_int(cur.fetchone()[0], 0)
+
+    cur.execute("SELECT COUNT(DISTINCT retailer_id) FROM products WHERE is_active=1")
+    retailer_count = parse_int(cur.fetchone()[0], 0)
+
+    cur.execute("SELECT COUNT(*) FROM categories WHERE is_active=1")
+    category_count = parse_int(cur.fetchone()[0], 0)
+
+    cur.close()
+    conn.close()
+    return {
+        "total_products": total_products,
+        "retailer_count": retailer_count,
+        "category_count": category_count,
+    }
+
+
+def list_categories() -> list[dict[str, Any]]:
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM categories WHERE is_active=1 ORDER BY name")
+    out = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return out
+
+
+def list_shop_products(search: str, category_id: int | None) -> list[dict[str, Any]]:
+    search = (search or "").strip().lower()
+    like = f"%{search}%"
+
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+
+    sql = """
+    SELECT p.id, p.name, p.description, p.price, p.original_price, p.stock, p.image_url, p.category_id,
+           c.name AS category_name,
+           u.username AS retailer_name,
+           ROUND(AVG(r.rating), 1) AS avg_rating,
+           COUNT(r.id) AS review_count
+    FROM products p
+    LEFT JOIN categories c ON c.id = p.category_id
+    LEFT JOIN users u ON u.id = p.retailer_id
+    LEFT JOIN reviews r ON r.product_id = p.id
+    WHERE p.is_active = 1
+    """
+
+    params: list[Any] = []
+    if search:
+        sql += " AND (LOWER(p.name) LIKE ? OR LOWER(COALESCE(p.description, '')) LIKE ? OR LOWER(COALESCE(c.name, '')) LIKE ?)"
+        params.extend([like, like, like])
+    if category_id:
+        sql += " AND p.category_id = ?"
+        params.append(category_id)
+
+    sql += " GROUP BY p.id, p.name, p.description, p.price, p.original_price, p.stock, p.image_url, p.category_id, c.name, u.username"
+    sql += " ORDER BY p.created_at DESC, p.id DESC"
+
+    cur.execute(sql, params)
+    out = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return out
+
+
+def get_product_by_id(product_id: int) -> dict[str, Any] | None:
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT p.id, p.retailer_id, p.category_id, p.name, p.description, p.price, p.original_price,
+               p.stock, p.image_url, p.is_active,
+               c.name AS category_name,
+               u.username AS retailer_name,
+               ROUND(AVG(r.rating), 1) AS avg_rating,
+               COUNT(r.id) AS review_count
+        FROM products p
+        LEFT JOIN categories c ON c.id = p.category_id
+        LEFT JOIN users u ON u.id = p.retailer_id
+        LEFT JOIN reviews r ON r.product_id = p.id
+        WHERE p.id = ? AND p.is_active = 1
+        GROUP BY p.id, p.retailer_id, p.category_id, p.name, p.description, p.price, p.original_price,
+                 p.stock, p.image_url, p.is_active, c.name, u.username
+        LIMIT 1
+        """,
+        (product_id,),
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_product_reviews(product_id: int) -> list[dict[str, Any]]:
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT r.rating, r.comment, r.created_at, u.username
+        FROM reviews r
+        JOIN users u ON u.id = r.user_id
+        WHERE r.product_id = ?
+        ORDER BY r.created_at DESC, r.id DESC
+        LIMIT 50
+        """,
+        (product_id,),
+    )
+    out = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return out
+
+
+def list_related_products(product: dict[str, Any], limit: int = 6) -> list[dict[str, Any]]:
+    category_id = parse_int(product.get("category_id"), 0)
+    product_id = parse_int(product.get("id"), 0)
+
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT p.id, p.name, p.price, p.image_url
+        FROM products p
+        WHERE p.is_active = 1
+          AND p.id != ?
+          AND (? = 0 OR p.category_id = ?)
+        ORDER BY p.created_at DESC, p.id DESC
+        LIMIT ?
+        """,
+        (product_id, category_id, category_id, limit),
+    )
+    out = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return out
+
+
+def is_in_wishlist(user_id: int, product_id: int) -> bool:
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM wishlists WHERE user_id=? AND product_id=? LIMIT 1",
+        (user_id, product_id),
+    )
+    found = cur.fetchone() is not None
+    cur.close()
+    conn.close()
+    return found
+
+
+def get_cart_items(user_id: int) -> tuple[list[dict[str, Any]], float]:
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT c.product_id, c.quantity,
+               p.name, p.price, p.stock, p.image_url,
+               u.username AS retailer_name
+        FROM cart c
+        JOIN products p ON p.id = c.product_id
+        LEFT JOIN users u ON u.id = p.retailer_id
+        WHERE c.user_id = ?
+        ORDER BY c.id DESC
+        """,
+        (user_id,),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+
+    total = 0.0
+    for row in rows:
+        qty = max(1, parse_int(row.get("quantity"), 1))
+        price = parse_float(row.get("price"), 0.0)
+        subtotal = round(qty * price, 2)
+        row["quantity"] = qty
+        row["subtotal"] = subtotal
+        total += subtotal
+
+    return rows, round(total, 2)
+
+
+def list_wishlist_items(user_id: int) -> list[dict[str, Any]]:
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT p.id, p.name, p.price, p.image_url,
+               u.username AS retailer_name
+        FROM wishlists w
+        JOIN products p ON p.id = w.product_id
+        LEFT JOIN users u ON u.id = p.retailer_id
+        WHERE w.user_id = ? AND p.is_active = 1
+        ORDER BY w.added_at DESC, w.id DESC
+        """,
+        (user_id,),
+    )
+    out = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return out
+
+
+def list_recommendations(limit: int = 8) -> list[dict[str, Any]]:
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT p.id, p.name, p.price, p.image_url,
+               u.username AS retailer_name
+        FROM products p
+        LEFT JOIN users u ON u.id = p.retailer_id
+        WHERE p.is_active = 1
+        ORDER BY p.created_at DESC, p.id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    out = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return out
+
+
+def add_to_cart(user_id: int, product_id: int, quantity: int) -> dict[str, Any]:
+    quantity = max(1, parse_int(quantity, 1))
+    now = sql_now_str()
+
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT id, stock FROM products WHERE id=? AND is_active=1 LIMIT 1",
+            (product_id,),
+        )
+        product = cur.fetchone()
+        if not product:
+            raise ValueError("Product not found.")
+
+        stock = max(0, parse_int(product["stock"], 0))
+        if stock <= 0:
+            raise ValueError("This product is out of stock.")
+
+        cur.execute(
+            "SELECT quantity FROM cart WHERE user_id=? AND product_id=? LIMIT 1",
+            (user_id, product_id),
+        )
+        row = cur.fetchone()
+        existing_qty = parse_int(row["quantity"], 0) if row else 0
+        new_qty = existing_qty + quantity
+        if new_qty > stock:
+            raise ValueError(f"Only {stock} item(s) are available.")
+
+        if row:
+            cur.execute(
+                "UPDATE cart SET quantity=?, updated_at=? WHERE user_id=? AND product_id=?",
+                (new_qty, now, user_id, product_id),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO cart (user_id, product_id, quantity, added_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (user_id, product_id, new_qty, now, now),
+            )
+
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+    return {
+        "cart_count": get_cart_count(user_id),
+    }
+
+
+def update_cart_quantity(user_id: int, product_id: int, quantity: int) -> dict[str, Any]:
+    quantity = parse_int(quantity, 1)
+    now = sql_now_str()
+
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    try:
+        if quantity <= 0:
+            cur.execute("DELETE FROM cart WHERE user_id=? AND product_id=?", (user_id, product_id))
+            conn.commit()
+        else:
+            cur.execute(
+                "SELECT stock, price FROM products WHERE id=? AND is_active=1 LIMIT 1",
+                (product_id,),
+            )
+            product = cur.fetchone()
+            if not product:
+                raise ValueError("Product not found.")
+
+            stock = max(0, parse_int(product["stock"], 0))
+            if quantity > stock:
+                raise ValueError(f"Only {stock} item(s) are available.")
+
+            cur.execute(
+                "UPDATE cart SET quantity=?, updated_at=? WHERE user_id=? AND product_id=?",
+                (quantity, now, user_id, product_id),
+            )
+            if cur.rowcount == 0:
+                raise ValueError("Item not found in cart.")
+            conn.commit()
+
+            subtotal = round(parse_float(product["price"], 0.0) * quantity, 2)
+            _, total = get_cart_items(user_id)
+            return {
+                "subtotal": subtotal,
+                "total": total,
+                "cart_count": get_cart_count(user_id),
+            }
+    finally:
+        cur.close()
+        conn.close()
+
+    _, total = get_cart_items(user_id)
+    return {
+        "subtotal": 0.0,
+        "total": total,
+        "cart_count": get_cart_count(user_id),
+    }
+
+
+def remove_cart_item(user_id: int, product_id: int) -> dict[str, Any]:
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM cart WHERE user_id=? AND product_id=?", (user_id, product_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    _, total = get_cart_items(user_id)
+    return {
+        "total": total,
+        "cart_count": get_cart_count(user_id),
+    }
+
+
+def toggle_wishlist(user_id: int, product_id: int) -> bool:
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT id FROM wishlists WHERE user_id=? AND product_id=? LIMIT 1",
+            (user_id, product_id),
+        )
+        existing = cur.fetchone()
+        if existing:
+            cur.execute("DELETE FROM wishlists WHERE user_id=? AND product_id=?", (user_id, product_id))
+            conn.commit()
+            return False
+
+        cur.execute("SELECT id FROM products WHERE id=? AND is_active=1 LIMIT 1", (product_id,))
+        if not cur.fetchone():
+            raise ValueError("Product not found.")
+
+        cur.execute(
+            """
+            INSERT INTO wishlists (user_id, product_id, added_at)
+            VALUES (?, ?, ?)
+            """,
+            (user_id, product_id, sql_now_str()),
+        )
+        conn.commit()
+        return True
+    finally:
+        cur.close()
+        conn.close()
+
+
+def add_review(user_id: int, product_id: int, rating: int, comment: str) -> None:
+    rating = max(1, min(5, parse_int(rating, 0)))
+    if rating <= 0:
+        raise ValueError("Rating must be between 1 and 5.")
+
+    comment = str(comment or "").strip()[:1000]
+    now = sql_now_str()
+
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT id FROM products WHERE id=? AND is_active=1 LIMIT 1", (product_id,))
+        if not cur.fetchone():
+            raise ValueError("Product not found.")
+
+        cur.execute(
+            """
+            SELECT 1
+            FROM orders o
+            JOIN order_items oi ON oi.order_id = o.id
+            WHERE o.customer_id = ? AND oi.product_id = ?
+            LIMIT 1
+            """,
+            (user_id, product_id),
+        )
+        verified_purchase = 1 if cur.fetchone() else 0
+
+        cur.execute(
+            """
+            INSERT INTO reviews
+            (product_id, user_id, rating, title, comment, is_verified_purchase, created_at)
+            VALUES (?, ?, ?, NULL, ?, ?, ?)
+            ON CONFLICT(product_id, user_id)
+            DO UPDATE SET
+                rating=excluded.rating,
+                comment=excluded.comment,
+                is_verified_purchase=excluded.is_verified_purchase,
+                created_at=excluded.created_at
+            """,
+            (product_id, user_id, rating, comment, verified_purchase, now),
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def place_order(user_id: int, payload: dict[str, Any]) -> tuple[int, str]:
+    shipping_name = str(payload.get("name") or "").strip()[:120]
+    shipping_phone = str(payload.get("phone") or "").strip()[:40]
+    shipping_address = str(payload.get("address") or "").strip()[:600]
+    notes = str(payload.get("notes") or "").strip()[:500]
+    payment_method = str(payload.get("payment_method") or "cod").strip().lower()
+    address_label = str(payload.get("address_label") or "Home").strip()[:40] or "Home"
+
+    if not shipping_name or not shipping_phone or not shipping_address:
+        raise ValueError("Name, phone, and address are required.")
+
+    allowed_payment_methods = {"cod", "card", "wallet", "bank_transfer"}
+    if payment_method not in allowed_payment_methods:
+        payment_method = "cod"
+
+    payment_ref = ""
+    payment_status = "pending"
+    order_status = "pending"
+    if payment_method != "cod":
+        payment_ref = f"PMT-{uuid.uuid4().hex[:10].upper()}"
+        payment_status = "paid"
+        order_status = "processing"
+
+    now = sql_now_str()
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT c.product_id, c.quantity,
+                   p.retailer_id, p.name, p.price, p.stock
+            FROM cart c
+            JOIN products p ON p.id = c.product_id
+            WHERE c.user_id = ? AND p.is_active = 1
+            ORDER BY c.id ASC
+            """,
+            (user_id,),
+        )
+        cart_rows = [dict(r) for r in cur.fetchall()]
+        if not cart_rows:
+            raise ValueError("Your cart is empty.")
+
+        order_total = 0.0
+        for row in cart_rows:
+            if parse_int(row.get("quantity"), 0) > parse_int(row.get("stock"), 0):
+                raise ValueError(f"Not enough stock for {row.get('name') or 'a product'}.")
+
+        cur.execute(
+            """
+            INSERT INTO orders
+            (customer_id, total_amount, status, shipping_name, shipping_address, shipping_phone,
+             notes, payment_method, payment_status, payment_ref, created_at, updated_at)
+            VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                order_status,
+                shipping_name,
+                shipping_address,
+                shipping_phone,
+                notes,
+                payment_method,
+                payment_status,
+                payment_ref,
+                now,
+                now,
+            ),
+        )
+        order_id = parse_int(cur.lastrowid, 0)
+
+        for row in cart_rows:
+            qty = max(1, parse_int(row.get("quantity"), 1))
+            price = parse_float(row.get("price"), 0.0)
+            subtotal = qty * price
+            order_total += subtotal
+
+            cur.execute(
+                """
+                INSERT INTO order_items
+                (order_id, product_id, retailer_id, product_name, quantity, unit_price, discount_per_unit)
+                VALUES (?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    order_id,
+                    parse_int(row.get("product_id"), 0),
+                    parse_int(row.get("retailer_id"), 0),
+                    str(row.get("name") or ""),
+                    qty,
+                    price,
+                ),
+            )
+
+            cur.execute(
+                "UPDATE products SET stock=MAX(stock - ?, 0), updated_at=? WHERE id=?",
+                (qty, now, parse_int(row.get("product_id"), 0)),
+            )
+
+        order_total = round(order_total, 2)
+        cur.execute(
+            "UPDATE orders SET total_amount=?, updated_at=? WHERE id=?",
+            (order_total, now, order_id),
+        )
+
+        cur.execute("DELETE FROM cart WHERE user_id=?", (user_id,))
+
+        cur.execute(
+            """
+            INSERT INTO payments
+            (order_id, payment_method, provider, amount_paid, payment_status, transaction_ref, paid_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                order_id,
+                payment_method,
+                "shopy-demo",
+                order_total,
+                payment_status,
+                payment_ref or None,
+                now if payment_status == "paid" else None,
+                now,
+            ),
+        )
+
+        cur.execute("UPDATE addresses SET is_default=0 WHERE user_id=?", (user_id,))
+        cur.execute(
+            """
+            INSERT INTO addresses
+            (user_id, label, full_name, phone, address_line, city, province, postal_code, country, is_default, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pakistan', 1, ?)
+            """,
+            (
+                user_id,
+                address_label,
+                shipping_name,
+                shipping_phone,
+                shipping_address,
+                str(payload.get("city") or "").strip()[:100],
+                str(payload.get("province") or "").strip()[:100],
+                str(payload.get("postal_code") or "").strip()[:20],
+                now,
+            ),
+        )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+    return order_id, payment_ref
+
+
+def list_customer_orders(user_id: int) -> list[dict[str, Any]]:
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT o.id, o.created_at, o.status, o.total_amount,
+               o.shipping_name, o.payment_method, o.payment_status, o.payment_ref,
+               COUNT(oi.id) AS item_count
+        FROM orders o
+        LEFT JOIN order_items oi ON oi.order_id = o.id
+        WHERE o.customer_id = ?
+        GROUP BY o.id, o.created_at, o.status, o.total_amount,
+                 o.shipping_name, o.payment_method, o.payment_status, o.payment_ref
+        ORDER BY o.created_at DESC, o.id DESC
+        """,
+        (user_id,),
+    )
+    out = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return out
+
+
+def list_customer_order_statuses(user_id: int) -> list[dict[str, Any]]:
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, status FROM orders WHERE customer_id=? ORDER BY id DESC",
+        (user_id,),
+    )
+    out = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return out
+
+
+def get_customer_summary(user_id: int) -> dict[str, Any]:
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM orders WHERE customer_id=?", (user_id,))
+    order_count = parse_int(cur.fetchone()[0], 0)
+
+    cur.execute("SELECT COUNT(*) FROM wishlists WHERE user_id=?", (user_id,))
+    wishlist_count = parse_int(cur.fetchone()[0], 0)
+
+    cur.execute("SELECT COALESCE(SUM(quantity), 0) FROM cart WHERE user_id=?", (user_id,))
+    cart_count = parse_int(cur.fetchone()[0], 0)
+
+    cur.execute(
+        "SELECT COALESCE(SUM(total_amount), 0) FROM orders WHERE customer_id=? AND status!='cancelled'",
+        (user_id,),
+    )
+    total_spent = parse_float(cur.fetchone()[0], 0.0)
+
+    cur.close()
+    conn.close()
+    return {
+        "order_count": order_count,
+        "wishlist_count": wishlist_count,
+        "cart_count": cart_count,
+        "total_spent": total_spent,
+    }
+
+
+def get_retailer_summary(user_id: int, session_token: str) -> dict[str, Any]:
+    dashboard = action_retailer_dashboard({"session_token": session_token})
+    stats = dict(dashboard.get("stats") or {})
+
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) FROM products WHERE retailer_id=? AND is_active=1 AND stock <= 5",
+        (user_id,),
+    )
+    low_stock_count = parse_int(cur.fetchone()[0], 0)
+    cur.close()
+    conn.close()
+
+    return {
+        "product_count": parse_int(stats.get("product_count"), 0),
+        "order_count": parse_int(stats.get("order_count"), 0),
+        "revenue": parse_float(stats.get("revenue"), 0.0),
+        "low_stock_count": low_stock_count,
+    }
+
+
+def get_user_profile(user_id: int) -> dict[str, Any]:
+    conn = sqlite_connect_rw()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, username, email, phone_number, role, profile_pic, bio, created_at
+        FROM users
+        WHERE id=?
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row:
+        raise ValueError("User not found.")
+    return dict(row)
+
+
+def flatten_assistant_reply(reply_obj: Any) -> dict[str, Any]:
+    if isinstance(reply_obj, dict):
+        answer = str(reply_obj.get("answer") or reply_obj.get("reply") or "")
+        payload = {
+            "reply": answer,
+        }
+        if reply_obj.get("query_ran"):
+            payload["query_ran"] = reply_obj.get("query_ran")
+        if reply_obj.get("db_output"):
+            payload["db_output"] = reply_obj.get("db_output")
+        if reply_obj.get("status"):
+            payload["status"] = reply_obj.get("status")
+        return payload
+
+    return {"reply": str(reply_obj or "")}
+
+
+def register_template_routes(app: Any) -> None:
+    if FileResponse is Any or HTMLResponse is Any or JSONResponse is Any or RedirectResponse is Any:
+        return
+
+    if getattr(app.state, "shopy_template_routes_ready", False):
+        return
+    app.state.shopy_template_routes_ready = True
+
+    # Gradio adds its own /login and /logout handlers; remove those so
+    # template forms and links can use the original application URLs.
+    router = getattr(app, "router", None)
+    existing_routes = getattr(router, "routes", None)
+    if isinstance(existing_routes, list):
+        filtered_routes = []
+        for route in existing_routes:
+            path = str(getattr(route, "path", "") or "")
+            methods = {str(m).upper() for m in (getattr(route, "methods", set()) or set())}
+            endpoint_name = str(getattr(getattr(route, "endpoint", None), "__name__", "") or "")
+
+            is_gradio_login = path == "/login" and "POST" in methods and endpoint_name == "login"
+            is_gradio_logout = path == "/logout" and "GET" in methods and endpoint_name == "logout"
+            is_gradio_root = path == "/" and endpoint_name == "main"
+            if is_gradio_login or is_gradio_logout or is_gradio_root:
+                continue
+            filtered_routes.append(route)
+
+        router.routes = filtered_routes
+
+    @app.get("/template-static/{asset_path:path}")
+    async def template_static(asset_path: str) -> Any:
+        safe_target = (STATIC_DIR / asset_path).resolve()
+        if not str(safe_target).startswith(str(STATIC_DIR.resolve())):
+            raise HTTPException(status_code=404, detail="Not found")
+        if not safe_target.exists() or not safe_target.is_file():
+            raise HTTPException(status_code=404, detail="Not found")
+        return FileResponse(str(safe_target))
+
+    @app.get("/")
+    async def route_root(request: Request) -> Any:
+        return redirect_to("/landing")
+
+    @app.get("/landing")
+    async def route_landing(request: Request) -> Any:
+        return render_template_html("landing.html", request)
+
+    @app.get("/login")
+    async def route_login_page(request: Request) -> Any:
+        return render_template_html("auth.html", request)
+
+    @app.post("/login")
+    async def route_login_submit(request: Request) -> Any:
+        form = await request.form()
+        payload = {
+            "email": str(form.get("email") or "").strip(),
+            "password": str(form.get("password") or ""),
+            "role": str(form.get("role") or "customer").strip().lower() or "customer",
+        }
+
+        try:
+            result = action_login(payload)
+        except Exception as exc:
+            return redirect_to("/login", error=str(exc), tab="login")
+
+        user_role = str((result.get("user") or {}).get("role") or "customer")
+        target = "/retailer/dashboard" if user_role == "retailer" else "/shop"
+
+        resp = redirect_to(target)
+        set_session_cookie(resp, str(result.get("session_token") or ""))
+        clear_pending_cookie(resp)
+        return resp
+
+    @app.post("/register")
+    async def route_register_submit(request: Request) -> Any:
+        form = await request.form()
+        payload = {
+            "username": str(form.get("username") or "").strip(),
+            "email": str(form.get("email") or "").strip(),
+            "password": str(form.get("password") or ""),
+            "phone": str(form.get("phone") or "").strip(),
+            "role": str(form.get("role") or "customer").strip().lower() or "customer",
+        }
+
+        try:
+            result = action_register(payload)
+        except Exception as exc:
+            return redirect_to("/login", error=str(exc), tab="register")
+
+        pending_token = str(result.get("pending_token") or "")
+        otp_hint = str(result.get("otp_hint") or "")
+
+        resp = redirect_to("/verify", error=(f"Demo OTP: {otp_hint}" if otp_hint else "Enter OTP to verify."))
+        set_pending_cookie(resp, pending_token)
+        return resp
+
+    @app.get("/verify")
+    async def route_verify_page(request: Request) -> Any:
+        pending_token = str(request.cookies.get(PENDING_COOKIE_NAME) or "").strip()
+        if not pending_token or pending_token not in PENDING_VERIFICATIONS:
+            return redirect_to("/login", tab="register", error="Start registration first.")
+        return render_template_html("verify.html", request)
+
+    @app.post("/verify")
+    async def route_verify_submit(request: Request) -> Any:
+        pending_token = str(request.cookies.get(PENDING_COOKIE_NAME) or "").strip()
+        pending = PENDING_VERIFICATIONS.get(pending_token)
+        if not pending_token or not pending:
+            if request.query_params.get("resend"):
+                return JSONResponse({"success": False, "message": "Register again first."}, status_code=400)
+            return redirect_to("/login", tab="register", error="Register again first.")
+
+        if str(request.query_params.get("resend") or "") == "1":
+            new_otp = generate_otp_code()
+            pending["otp"] = new_otp
+            pending["expires_at"] = utc_now() + timedelta(minutes=OTP_TTL_MINUTES)
+            return JSONResponse(
+                {
+                    "success": True,
+                    "message": f"New demo OTP: {new_otp}",
+                }
+            )
+
+        form = await request.form()
+        otp = str(form.get("otp") or "").strip()
+
+        try:
+            verified = action_verify_otp({"pending_token": pending_token, "otp": otp})
+        except Exception as exc:
+            return redirect_to("/verify", error=str(exc))
+
+        role = str((verified.get("user") or {}).get("role") or "customer")
+        target = "/retailer/dashboard" if role == "retailer" else "/shop"
+        resp = redirect_to(target)
+        set_session_cookie(resp, str(verified.get("session_token") or ""))
+        clear_pending_cookie(resp)
+        return resp
+
+    @app.get("/logout")
+    async def route_logout(request: Request) -> Any:
+        token, _session_info = get_request_session(request)
+        if token:
+            try:
+                action_logout({"session_token": token})
+            except Exception:
+                pass
+
+        resp = redirect_to("/login")
+        clear_session_cookie(resp)
+        clear_pending_cookie(resp)
+        return resp
+
+    @app.get("/shop")
+    async def route_shop(request: Request) -> Any:
+        _token, session_info, redirect_resp = require_page_session(request, required_role="customer")
+        if redirect_resp:
+            return redirect_resp
+
+        user_id = parse_int((session_info or {}).get("user_id"), 0)
+        q = str(request.query_params.get("q") or "").strip()
+        category_raw = str(request.query_params.get("category") or "").strip()
+        category_id = parse_int(category_raw, 0) if category_raw else None
+        if category_id == 0:
+            category_id = None
+
+        products = list_shop_products(q, category_id)
+        categories = list_categories()
+        stats = get_customer_shop_stats()
+
+        return render_template_html(
+            "shop.html",
+            request,
+            username=str((session_info or {}).get("username") or "Customer"),
+            cart_count=get_cart_count(user_id),
+            search=q,
+            products=products,
+            categories=categories,
+            cat_filter=category_raw,
+            total_products=stats["total_products"],
+            retailer_count=stats["retailer_count"],
+            category_count=stats["category_count"],
+        )
+
+    @app.get("/product/{product_id}")
+    async def route_product(request: Request, product_id: int) -> Any:
+        _token, session_info, redirect_resp = require_page_session(request, required_role="customer")
+        if redirect_resp:
+            return redirect_resp
+
+        user_id = parse_int((session_info or {}).get("user_id"), 0)
+        product = get_product_by_id(product_id)
+        if not product:
+            return redirect_to("/shop")
+
+        return render_template_html(
+            "product.html",
+            request,
+            product=product,
+            cart_count=get_cart_count(user_id),
+            in_wishlist=is_in_wishlist(user_id, product_id),
+            reviews=list_product_reviews(product_id),
+            related=list_related_products(product, limit=8),
+        )
+
+    @app.get("/cart")
+    async def route_cart(request: Request) -> Any:
+        _token, session_info, redirect_resp = require_page_session(request, required_role="customer")
+        if redirect_resp:
+            return redirect_resp
+
+        user_id = parse_int((session_info or {}).get("user_id"), 0)
+        items, total = get_cart_items(user_id)
+        return render_template_html(
+            "cart.html",
+            request,
+            items=items,
+            total=total,
+            recommendations=([] if items else list_recommendations(8)),
+        )
+
+    @app.get("/wishlist")
+    async def route_wishlist(request: Request) -> Any:
+        _token, session_info, redirect_resp = require_page_session(request, required_role="customer")
+        if redirect_resp:
+            return redirect_resp
+
+        user_id = parse_int((session_info or {}).get("user_id"), 0)
+        items = list_wishlist_items(user_id)
+        return render_template_html(
+            "wishlist.html",
+            request,
+            items=items,
+            cart_count=get_cart_count(user_id),
+            recommendations=([] if items else list_recommendations(8)),
+        )
+
+    @app.get("/checkout")
+    async def route_checkout(request: Request) -> Any:
+        _token, session_info, redirect_resp = require_page_session(request, required_role="customer")
+        if redirect_resp:
+            return redirect_resp
+
+        user_id = parse_int((session_info or {}).get("user_id"), 0)
+        items, total = get_cart_items(user_id)
+        if not items:
+            return redirect_to("/cart")
+
+        profile = get_user_profile(user_id)
+        return render_template_html(
+            "checkout.html",
+            request,
+            items=items,
+            total=total,
+            default_address=get_customer_default_address(user_id),
+            profile=profile,
+        )
+
+    @app.get("/orders")
+    async def route_orders(request: Request) -> Any:
+        _token, session_info, redirect_resp = require_page_session(request, required_role="customer")
+        if redirect_resp:
+            return redirect_resp
+
+        user_id = parse_int((session_info or {}).get("user_id"), 0)
+        orders = list_customer_orders(user_id)
+        return render_template_html(
+            "orders.html",
+            request,
+            orders=orders,
+            recommendations=([] if orders else list_recommendations(8)),
+        )
+
+    @app.get("/profile")
+    async def route_profile(request: Request) -> Any:
+        token, session_info, redirect_resp = require_page_session(request)
+        if redirect_resp:
+            return redirect_resp
+
+        role = str((session_info or {}).get("role") or "customer")
+        user_id = parse_int((session_info or {}).get("user_id"), 0)
+        user = get_user_profile(user_id)
+
+        if role == "retailer":
+            summary = get_retailer_summary(user_id, token)
+            return render_template_html(
+                "profile.html",
+                request,
+                role="retailer",
+                user=user,
+                summary=summary,
+                default_address=None,
+            )
+
+        return render_template_html(
+            "profile.html",
+            request,
+            role="customer",
+            user=user,
+            summary=get_customer_summary(user_id),
+            default_address=get_customer_default_address(user_id),
+        )
+
+    @app.get("/retailer/dashboard")
+    async def route_retailer_dashboard(request: Request) -> Any:
+        token, session_info, redirect_resp = require_page_session(request, required_role="retailer")
+        if redirect_resp:
+            return redirect_resp
+
+        data = action_retailer_dashboard({"session_token": token})
+        stats = dict(data.get("stats") or {})
+
+        return render_template_html(
+            "retailer_dashboard.html",
+            request,
+            username=str((session_info or {}).get("username") or "Retailer"),
+            product_count=parse_int(stats.get("product_count"), 0),
+            order_count=parse_int(stats.get("order_count"), 0),
+            revenue=parse_float(stats.get("revenue"), 0.0),
+            pending_count=parse_int(stats.get("pending_count"), 0),
+            recent_orders=data.get("recent_orders") or [],
+            top_products=data.get("top_products") or [],
+        )
+
+    @app.get("/retailer/products")
+    async def route_retailer_products(request: Request) -> Any:
+        token, session_info, redirect_resp = require_page_session(request, required_role="retailer")
+        if redirect_resp:
+            return redirect_resp
+
+        data = action_retailer_products({"session_token": token})
+        return render_template_html(
+            "retailer_products.html",
+            request,
+            username=str((session_info or {}).get("username") or "Retailer"),
+            products=data.get("products") or [],
+            categories=data.get("categories") or [],
+        )
+
+    @app.get("/retailer/orders")
+    async def route_retailer_orders(request: Request) -> Any:
+        token, session_info, redirect_resp = require_page_session(request, required_role="retailer")
+        if redirect_resp:
+            return redirect_resp
+
+        status_filter = str(request.query_params.get("status") or "").strip().lower()
+        data = action_retailer_orders({"session_token": token, "status": status_filter})
+        return render_template_html(
+            "retailer_orders.html",
+            request,
+            username=str((session_info or {}).get("username") or "Retailer"),
+            orders=data.get("orders") or [],
+            status_filter=data.get("status_filter") or "",
+        )
+
+    @app.get("/retailer/assistant")
+    async def route_retailer_assistant(request: Request) -> Any:
+        _token, session_info, redirect_resp = require_page_session(request, required_role="retailer")
+        if redirect_resp:
+            return redirect_resp
+
+        return render_template_html(
+            "retailer_assistant.html",
+            request,
+            username=str((session_info or {}).get("username") or "Retailer"),
+        )
+
+    @app.get("/retailer/profile")
+    async def route_retailer_profile_page(request: Request) -> Any:
+        _token, session_info, redirect_resp = require_page_session(request, required_role="retailer")
+        if redirect_resp:
+            return redirect_resp
+
+        user_id = parse_int((session_info or {}).get("user_id"), 0)
+        return render_template_html(
+            "retailer_profile.html",
+            request,
+            user=get_user_profile(user_id),
+        )
+
+    @app.post("/api/cart/add")
+    async def api_cart_add(request: Request) -> Any:
+        _token, session_info, auth_error = require_api_session(request, required_role="customer")
+        if auth_error:
+            return auth_error
+
+        body = await parse_json_body(request)
+        user_id = parse_int((session_info or {}).get("user_id"), 0)
+
+        try:
+            result = add_to_cart(
+                user_id,
+                parse_int(body.get("product_id"), 0),
+                parse_int(body.get("quantity"), 1),
+            )
+            return JSONResponse({"success": True, **result})
+        except Exception as exc:
+            return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+
+    @app.post("/api/cart/update")
+    async def api_cart_update(request: Request) -> Any:
+        _token, session_info, auth_error = require_api_session(request, required_role="customer")
+        if auth_error:
+            return auth_error
+
+        body = await parse_json_body(request)
+        user_id = parse_int((session_info or {}).get("user_id"), 0)
+
+        try:
+            result = update_cart_quantity(
+                user_id,
+                parse_int(body.get("product_id"), 0),
+                parse_int(body.get("quantity"), 1),
+            )
+            return JSONResponse({"success": True, **result})
+        except Exception as exc:
+            return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+
+    @app.post("/api/cart/remove")
+    async def api_cart_remove(request: Request) -> Any:
+        _token, session_info, auth_error = require_api_session(request, required_role="customer")
+        if auth_error:
+            return auth_error
+
+        body = await parse_json_body(request)
+        user_id = parse_int((session_info or {}).get("user_id"), 0)
+
+        try:
+            result = remove_cart_item(user_id, parse_int(body.get("product_id"), 0))
+            return JSONResponse({"success": True, **result})
+        except Exception as exc:
+            return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+
+    @app.post("/api/wishlist/toggle")
+    async def api_wishlist_toggle(request: Request) -> Any:
+        _token, session_info, auth_error = require_api_session(request, required_role="customer")
+        if auth_error:
+            return auth_error
+
+        body = await parse_json_body(request)
+        user_id = parse_int((session_info or {}).get("user_id"), 0)
+
+        try:
+            in_wishlist = toggle_wishlist(user_id, parse_int(body.get("product_id"), 0))
+            return JSONResponse({"success": True, "in_wishlist": in_wishlist})
+        except Exception as exc:
+            return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+
+    @app.post("/api/review/add")
+    async def api_review_add(request: Request) -> Any:
+        _token, session_info, auth_error = require_api_session(request, required_role="customer")
+        if auth_error:
+            return auth_error
+
+        body = await parse_json_body(request)
+        user_id = parse_int((session_info or {}).get("user_id"), 0)
+
+        try:
+            add_review(
+                user_id,
+                parse_int(body.get("product_id"), 0),
+                parse_int(body.get("rating"), 0),
+                str(body.get("comment") or ""),
+            )
+            return JSONResponse({"success": True})
+        except Exception as exc:
+            return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+
+    @app.post("/api/order/place")
+    async def api_order_place(request: Request) -> Any:
+        _token, session_info, auth_error = require_api_session(request, required_role="customer")
+        if auth_error:
+            return auth_error
+
+        body = await parse_json_body(request)
+        user_id = parse_int((session_info or {}).get("user_id"), 0)
+
+        try:
+            order_id, payment_ref = place_order(user_id, body)
+            return JSONResponse(
+                {
+                    "success": True,
+                    "order_id": order_id,
+                    "payment_ref": payment_ref,
+                }
+            )
+        except Exception as exc:
+            return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+
+    @app.get("/api/orders/statuses")
+    async def api_order_statuses(request: Request) -> Any:
+        _token, session_info, auth_error = require_api_session(request, required_role="customer")
+        if auth_error:
+            return auth_error
+
+        user_id = parse_int((session_info or {}).get("user_id"), 0)
+        return JSONResponse(
+            {
+                "success": True,
+                "orders": list_customer_order_statuses(user_id),
+            }
+        )
+
+    @app.post("/api/profile/update")
+    async def api_profile_update(request: Request) -> Any:
+        token, session_info, auth_error = require_api_session(request)
+        if auth_error:
+            return auth_error
+
+        role = str((session_info or {}).get("role") or "customer")
+        body = await parse_json_body(request)
+        body["session_token"] = token
+
+        try:
+            if role == "retailer":
+                data = action_retailer_profile_update(body)
+            else:
+                data = action_customer_profile_update(body)
+            return JSONResponse({"success": True, **data})
+        except Exception as exc:
+            return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+
+    @app.post("/api/profile/address")
+    async def api_profile_address(request: Request) -> Any:
+        _token, session_info, auth_error = require_api_session(request, required_role="customer")
+        if auth_error:
+            return auth_error
+
+        user_id = parse_int((session_info or {}).get("user_id"), 0)
+        body = await parse_json_body(request)
+        try:
+            save_customer_default_address(user_id, body)
+            return JSONResponse({"success": True})
+        except Exception as exc:
+            return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+
+    @app.post("/api/ai/chat")
+    async def api_ai_chat(request: Request) -> Any:
+        token, session_info, auth_error = require_api_session(request)
+        if auth_error:
+            return auth_error
+
+        body = await parse_json_body(request)
+        message = str(body.get("message") or "").strip()
+        if not message:
+            return JSONResponse({"success": False, "error": "Message is required."}, status_code=400)
+
+        role = str((session_info or {}).get("role") or "customer")
+        try:
+            if role == "retailer":
+                result = action_assistant_chat({"session_token": token, "message": message})
+            else:
+                result = action_customer_assistant_chat({"session_token": token, "message": message})
+            payload = flatten_assistant_reply(result.get("reply"))
+            return JSONResponse({"success": True, **payload})
+        except Exception as exc:
+            return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+
+    @app.get("/api/ai/history")
+    async def api_ai_history(request: Request) -> Any:
+        token, session_info, auth_error = require_api_session(request)
+        if auth_error:
+            return auth_error
+
+        role = str((session_info or {}).get("role") or "customer")
+        try:
+            if role == "retailer":
+                result = action_assistant_history({"session_token": token})
+            else:
+                result = action_customer_assistant_history({"session_token": token})
+            return JSONResponse({"success": True, "history": result.get("history") or []})
+        except Exception as exc:
+            return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+
+    @app.post("/api/retailer/product/add")
+    async def api_retailer_product_add(request: Request) -> Any:
+        token, _session_info, auth_error = require_api_session(request, required_role="retailer")
+        if auth_error:
+            return auth_error
+
+        form = await request.form()
+        payload: dict[str, Any] = {
+            "session_token": token,
+            "name": str(form.get("name") or ""),
+            "description": str(form.get("description") or ""),
+            "price": str(form.get("price") or "0"),
+            "original_price": str(form.get("original_price") or ""),
+            "stock": str(form.get("stock") or "0"),
+            "category_id": str(form.get("category_id") or ""),
+            "is_active": str(form.get("is_active") or "1"),
+        }
+
+        image_file = form.get("image")
+        if image_file is not None and hasattr(image_file, "filename") and getattr(image_file, "filename", ""):
+            raw = await image_file.read()
+            if raw:
+                mime = str(getattr(image_file, "content_type", "") or "application/octet-stream")
+                payload["image_data"] = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+
+        try:
+            result = action_retailer_add_product(payload)
+            return JSONResponse({"success": True, **result})
+        except Exception as exc:
+            return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+
+    @app.post("/api/retailer/product/{product_id}/edit")
+    async def api_retailer_product_edit(request: Request, product_id: int) -> Any:
+        token, _session_info, auth_error = require_api_session(request, required_role="retailer")
+        if auth_error:
+            return auth_error
+
+        form = await request.form()
+        payload: dict[str, Any] = {
+            "session_token": token,
+            "product_id": product_id,
+            "name": str(form.get("name") or ""),
+            "description": str(form.get("description") or ""),
+            "price": str(form.get("price") or "0"),
+            "original_price": str(form.get("original_price") or ""),
+            "stock": str(form.get("stock") or "0"),
+            "category_id": str(form.get("category_id") or ""),
+            "is_active": str(form.get("is_active") or "1"),
+        }
+
+        image_file = form.get("image")
+        if image_file is not None and hasattr(image_file, "filename") and getattr(image_file, "filename", ""):
+            raw = await image_file.read()
+            if raw:
+                mime = str(getattr(image_file, "content_type", "") or "application/octet-stream")
+                payload["image_data"] = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+
+        try:
+            result = action_retailer_edit_product(payload)
+            return JSONResponse({"success": True, **result})
+        except Exception as exc:
+            return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+
+    @app.post("/api/retailer/product/{product_id}/delete")
+    async def api_retailer_product_delete(request: Request, product_id: int) -> Any:
+        token, _session_info, auth_error = require_api_session(request, required_role="retailer")
+        if auth_error:
+            return auth_error
+
+        try:
+            result = action_retailer_delete_product({"session_token": token, "product_id": product_id})
+            return JSONResponse({"success": True, **result})
+        except Exception as exc:
+            return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+
+    @app.post("/api/retailer/order/{order_id}/status")
+    async def api_retailer_order_status(request: Request, order_id: int) -> Any:
+        token, _session_info, auth_error = require_api_session(request, required_role="retailer")
+        if auth_error:
+            return auth_error
+
+        body = await parse_json_body(request)
+        try:
+            result = action_retailer_update_order_status(
+                {
+                    "session_token": token,
+                    "order_id": order_id,
+                    "status": str(body.get("status") or ""),
+                }
+            )
+            return JSONResponse({"success": True, **result})
+        except Exception as exc:
+            return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+
 
 
 def load_runtime_asset_text(filename: str, fallback: str) -> str:
@@ -5122,6 +6724,9 @@ def main() -> None:
         js_text=js_text,
         html_text=html_text,
     )
+
+    # Attach template-compatible page/API routes to Gradio's underlying ASGI app.
+    register_template_routes(getattr(app, "app", app))
 
     launch_kwargs: dict[str, Any] = {
         "share": in_colab,
